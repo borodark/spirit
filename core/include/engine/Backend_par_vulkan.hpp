@@ -1,0 +1,157 @@
+#pragma once
+#ifndef SPIRIT_CORE_ENGINE_BACKEND_PAR_VULKAN_HPP
+#define SPIRIT_CORE_ENGINE_BACKEND_PAR_VULKAN_HPP
+
+/* Backend_par_vulkan.hpp — Vulkan compute backend for Spirit.
+ *
+ * Third backend alongside CUDA (Backend_par.hpp) and sequential
+ * (Backend_seq.hpp). Uses Vulkan compute shaders + VkFFT for
+ * GPU-accelerated spin simulations on any Vulkan-capable GPU
+ * (NVIDIA, AMD, Intel).
+ *
+ * Pattern follows Backend_par.hpp: apply(N, f), reduce(N, ...),
+ * set(vf1, vf2, f). Instead of CUDA kernels or OpenMP pragmas,
+ * dispatches pre-compiled SPIR-V compute shaders via vkCmdDispatch.
+ *
+ * Requires: Vulkan 1.1+, VkFFT (header-only, in thirdparty/).
+ */
+
+#include <vulkan/vulkan.h>
+#include <engine/Vectormath_Defines.hpp>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unordered_map>
+
+namespace Engine
+{
+namespace Backend
+{
+namespace vulkan
+{
+
+/* ----------------------------------------------------------------
+ * Vulkan compute context — one per Spirit simulation instance.
+ * Initialized once via vk_init(), destroyed via vk_destroy().
+ * ---------------------------------------------------------------- */
+
+struct VkContext
+{
+    VkInstance instance             = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+    VkDevice device                = VK_NULL_HANDLE;
+    VkQueue compute_queue          = VK_NULL_HANDLE;
+    uint32_t queue_family_index    = 0;
+    VkCommandPool command_pool     = VK_NULL_HANDLE;
+
+    VkPhysicalDeviceProperties device_props{};
+    VkPhysicalDeviceMemoryProperties mem_props{};
+    bool has_float64 = false;
+
+    /* Shader cache: spv_path → VkShaderModule */
+    std::unordered_map<std::string, VkShaderModule> shader_cache;
+
+    /* Reusable fence for synchronous dispatch */
+    VkFence sync_fence = VK_NULL_HANDLE;
+};
+
+/* Global context — matches Spirit's pattern of global state in
+ * Backend::par (CUDA uses global streams/handles). */
+extern VkContext g_vk_ctx;
+
+/* ----------------------------------------------------------------
+ * GPU buffer — wraps VkBuffer + VkDeviceMemory.
+ * Used as the backing store for field<T> on Vulkan.
+ * ---------------------------------------------------------------- */
+
+struct VkBuf
+{
+    VkBuffer buffer       = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size     = 0;
+};
+
+/* ----------------------------------------------------------------
+ * Pipeline — shader + descriptor set + pipeline layout.
+ * Cached per (shader_path, specialization_constant) pair.
+ * ---------------------------------------------------------------- */
+
+struct VkPipe
+{
+    VkDescriptorPool descriptor_pool         = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptor_layout  = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set           = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout         = VK_NULL_HANDLE;
+    VkPipeline pipeline                      = VK_NULL_HANDLE;
+};
+
+/* ----------------------------------------------------------------
+ * Lifecycle
+ * ---------------------------------------------------------------- */
+
+/* Initialize the global Vulkan context. Call once at startup.
+ * device_id: index into vkEnumeratePhysicalDevices result. */
+int  vk_init(int device_id = 0);
+void vk_destroy();
+
+/* ----------------------------------------------------------------
+ * Memory helpers
+ * ---------------------------------------------------------------- */
+
+uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags props);
+
+int  buf_alloc(VkBuf* b, VkDeviceSize size, VkBufferUsageFlags usage,
+               VkMemoryPropertyFlags mem_flags);
+void buf_free(VkBuf* b);
+
+/* Host ↔ Device transfer via staging buffer. */
+int  upload(VkBuf* dst, const void* data, VkDeviceSize size);
+int  download(VkBuf* src, void* data, VkDeviceSize size);
+
+/* ----------------------------------------------------------------
+ * Shader / pipeline management
+ * ---------------------------------------------------------------- */
+
+VkShaderModule load_shader(const std::string& spv_path);
+
+int  create_pipeline(VkPipe* p, VkShaderModule shader,
+                     uint32_t n_buffers, uint32_t push_constant_size,
+                     int32_t spec_constant = 0);
+void destroy_pipeline(VkPipe* p);
+
+/* ----------------------------------------------------------------
+ * Dispatch — record + submit + wait
+ * ---------------------------------------------------------------- */
+
+int dispatch(VkPipe* p, VkBuffer* buffers, uint32_t n_buffers,
+             uint32_t group_count_x,
+             uint32_t push_size = 0, const void* push_data = nullptr);
+
+/* ----------------------------------------------------------------
+ * Parallel primitives — matching Backend::par interface
+ * ---------------------------------------------------------------- */
+
+/* Apply a compute shader to N elements.
+ * shader_id: index into the registered shader table.
+ * The shader reads/writes through storage buffer bindings. */
+void apply(int N, VkPipe* pipe, VkBuffer* buffers, uint32_t n_buffers);
+
+/* Reduction: sum all elements of a device buffer into a host scalar.
+ * Uses a two-pass subgroup reduction shader. */
+scalar reduce_sum(VkBuf* input, int N);
+
+/* Scale all elements: buf[i] *= alpha */
+void scale(VkBuf* buf, int N, scalar alpha);
+
+/* Element-wise add: out[i] = a[i] + b[i] */
+void add(VkBuf* out, VkBuf* a, VkBuf* b, int N);
+
+/* Dot product: sum(a[i] * b[i]) */
+scalar dot(VkBuf* a, VkBuf* b, int N);
+
+} // namespace vulkan
+} // namespace Backend
+} // namespace Engine
+
+#endif /* SPIRIT_CORE_ENGINE_BACKEND_PAR_VULKAN_HPP */

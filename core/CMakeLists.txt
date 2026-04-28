@@ -65,8 +65,24 @@ if( SPIRIT_USE_CUDA )
     enable_language( CUDA )
 endif()
 #-----
+if( SPIRIT_USE_VULKAN )
+    ### If Vulkan is used, disable CUDA and OpenMP
+    set( SPIRIT_USE_CUDA         OFF )
+    set( SPIRIT_USE_OPENMP       OFF )
+    set( SPIRIT_SCALAR_TYPE      float )
+    set( SPIRIT_USE_FFTW         OFF )
+    set( SPIRIT_BUILD_FOR_JS     OFF )
+    set( SPIRIT_BUILD_FOR_JULIA  OFF )
+    ### Find Vulkan SDK
+    find_package( Vulkan REQUIRED )
+    message( STATUS ">> Spirit core: Using Vulkan compute backend" )
+    message( STATUS ">>   Vulkan include: ${Vulkan_INCLUDE_DIRS}" )
+    message( STATUS ">>   Vulkan library: ${Vulkan_LIBRARIES}" )
+endif()
+#-----
 if( SPIRIT_USE_OPENMP )
     set( SPIRIT_USE_CUDA         OFF )
+    set( SPIRIT_USE_VULKAN       OFF )
     set( SPIRIT_BUILD_FOR_JS     OFF )
     set( SPIRIT_BUILD_FOR_JULIA  OFF )
 endif()
@@ -403,6 +419,21 @@ if( SPIRIT_USE_CUDA )
         ${CMAKE_CURRENT_LIST_DIR}/test/test_ema.cpp
         ${CMAKE_CURRENT_LIST_DIR}/test/test_anisotropy.cpp
         PROPERTIES LANGUAGE CUDA )
+endif()
+
+### Extra Vulkan things
+if( SPIRIT_USE_VULKAN )
+    target_link_libraries( ${META_PROJECT_NAME} INTERFACE Vulkan::Vulkan )
+    set( SPIRIT_COMPILE_DEFINITIONS ${SPIRIT_COMPILE_DEFINITIONS} -DSPIRIT_USE_VULKAN )
+    ### Add Vulkan backend source
+    target_sources( ${META_PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/src/engine/Backend_par_vulkan.cpp
+    )
+    ### VkFFT header-only library
+    target_include_directories( ${META_PROJECT_NAME} PUBLIC
+        ${CMAKE_CURRENT_LIST_DIR}/thirdparty/VkFFT
+    )
+    message( STATUS ">> Spirit core: Vulkan backend sources added" )
 endif()
 
 ### Coverage flags and linking if needed
