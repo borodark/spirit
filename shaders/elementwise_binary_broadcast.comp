@@ -1,0 +1,57 @@
+#version 450
+
+layout (local_size_x = 256) in;
+
+layout (constant_id = 0) const int OP = 0;
+
+layout (push_constant) uniform Push {
+    uint n;           // total output elements
+    uint ndim;        // number of dimensions (1-4)
+    // Output shape + input strides packed:
+    // [out_shape[0..3], a_strides[0..3], b_strides[0..3]]
+    uint out_shape[4];
+    uint a_strides[4];   // stride=0 means broadcast on that axis
+    uint b_strides[4];
+} pc;
+
+layout (std430, binding = 0) readonly buffer InputA { float a[]; };
+layout (std430, binding = 1) readonly buffer InputB { float b[]; };
+layout (std430, binding = 2) writeonly buffer Output { float c[]; };
+
+// Convert flat output index to input index using strides.
+// Stride=0 broadcasts (all coordinates on that axis map to index 0).
+uint broadcast_idx(uint out_flat, uint ndim, uint shape[4], uint strides[4]) {
+    uint idx = 0u;
+    uint remaining = out_flat;
+    for (int d = int(ndim) - 1; d >= 0; d--) {
+        uint coord = remaining % shape[d];
+        remaining /= shape[d];
+        idx += coord * strides[d];
+    }
+    return idx;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    uint a_idx = broadcast_idx(i, pc.ndim, pc.out_shape, pc.a_strides);
+    uint b_idx = broadcast_idx(i, pc.ndim, pc.out_shape, pc.b_strides);
+
+    float x = a[a_idx];
+    float y = b[b_idx];
+    float r;
+
+    switch (OP) {
+        case 0: r = x + y; break;
+        case 1: r = x * y; break;
+        case 2: r = x - y; break;
+        case 3: r = x / y; break;
+        case 4: r = pow(x, y); break;
+        case 5: r = max(x, y); break;
+        case 6: r = min(x, y); break;
+        default: r = 0.0; break;
+    }
+
+    c[i] = r;
+}
