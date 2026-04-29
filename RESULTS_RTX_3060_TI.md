@@ -101,6 +101,57 @@ is the hot loop).
 
 ---
 
+## Tiled matmul — SHADERS_PLAN.md iter 4
+
+`shaders/matmul_tiled.comp` — 16×16 workgroup tiles loaded into
+shared memory, each tile contributing `tile_size` accumulations
+to a 16×16 block of C. 4 correctness tests pass including the
+non-aligned 17×19 · 19×13 case (boundary-padding handled). Bench
+in the same run as naive (GPU now fully warmed):
+
+```
+M=N=K       naive (GFLOPS)    tiled (GFLOPS)    speedup
+64                  9.8                 11.0       1.1x
+128                89.2                 83.7       0.9x
+256               209.5                491.0       2.3x   ← best ratio
+512               699.7                622.6       0.9x
+1024              919.9               1199.6       1.3x
+```
+
+The peaks shift around with thermal/scheduler noise (note that
+naive itself doubles between runs once the GPU is hot). The
+honest read: tiled wins at 256² where shared-memory reuse hits
+its sweet spot; at 1024² the naive kernel's good cache utilization
+narrows the gap. Ampere's 128 KB L1/SMEM per SM means the naive
+loop can pull from L1 efficiently when sizes line up. RDNA / older
+Kepler will see bigger tiled wins.
+
+7.5% of f32 peak (16 TFLOPS) at 1024² is solid for one-day work;
+shape-specific tuning (rectangular tiles, multi-stage prefetch)
+is the next perf delta if a workload demands it.
+
+---
+
+## Broadcasting elementwise binary — beyond original plan
+
+`shaders/elementwise_binary_broadcast.comp` — full Nx-style
+broadcasting up to 4D. 7 correctness tests pass:
+
+  - `[3] + [1]` (scalar broadcast)
+  - `[2,3] + [1,3]` (row broadcast)
+  - `[2,3] + [2,1]` (col broadcast)
+  - `[3,1] + [1,4]` (outer broadcast)
+  - `[3,1] * [1,4]` (outer product)
+  - `[2,1,3] + [1,4,1]` (3D broadcast)
+
+Same 7 binary ops as the non-broadcasting kernel (add, mul, sub,
+div, pow, max, min). This unlocks the broadcasting half of Nx's
+binary-op surface — without it, the wrapper would have to
+materialize broadcasted operands manually, doubling memory
+traffic for every broadcasted op.
+
+---
+
 ## Random (Philox + Box-Muller) — beyond original plan
 
 `shaders/random_philox.comp` — counter-based PRNG (Philox 4×32-10)
