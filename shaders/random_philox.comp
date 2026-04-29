@@ -1,0 +1,82 @@
+#version 450
+
+layout (local_size_x = 256) in;
+
+// Specialization constant: 0=uniform [0,1), 1=normal (Box-Muller)
+layout (constant_id = 0) const int DIST = 0;
+
+layout (push_constant) uniform Push {
+    uint n;
+    uint seed;
+} pc;
+
+layout (std430, binding = 0) writeonly buffer Output { float out_data[]; };
+
+// Philox 2x32-10 counter-based RNG.
+// Deterministic: same (seed, index) → same output.
+//
+// Manual 32x32→64 multiply: a*b = (a_hi*b_lo + a_lo*b_hi)<<16 + a_lo*b_lo
+// We only need the high 32 bits of (lo * 0xD2511F53).
+uvec2 mulhilo(uint a, uint b) {
+    // Split into 16-bit halves to avoid needing 64-bit
+    uint a_lo = a & 0xFFFFu;
+    uint a_hi = a >> 16u;
+    uint b_lo = b & 0xFFFFu;
+    uint b_hi = b >> 16u;
+
+    uint ll = a_lo * b_lo;
+    uint lh = a_lo * b_hi;
+    uint hl = a_hi * b_lo;
+    uint hh = a_hi * b_hi;
+
+    uint carry = ((ll >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu)) >> 16u;
+    uint hi = hh + (lh >> 16u) + (hl >> 16u) + carry;
+    uint lo = a * b;  // low 32 bits = just truncated multiply
+
+    return uvec2(lo, hi);
+}
+
+uvec2 philox2x32(uint counter, uint key) {
+    uint lo = counter;
+    uint hi = key;
+
+    for (int i = 0; i < 10; i++) {
+        uvec2 prod = mulhilo(lo, 0xD2511F53u);
+        lo = hi ^ prod.y;     // hi 32 bits of product
+        hi = prod.x;          // lo 32 bits of product
+        hi += 0x9E3779B9u;    // bump key
+    }
+
+    return uvec2(lo, hi);
+}
+
+float uint_to_uniform(uint x) {
+    // Map uint32 → [0, 1) with 23 bits of mantissa
+    return float(x >> 9u) * (1.0 / 8388608.0);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    if (DIST == 0) {
+        // Uniform [0, 1)
+        uvec2 r = philox2x32(i, pc.seed);
+        out_data[i] = uint_to_uniform(r.x);
+    } else {
+        // Normal via Box-Muller (generates pairs)
+        // Even index: compute both, write this one
+        // Odd index: compute both, write the other
+        uint pair_idx = i / 2u;
+        uvec2 r = philox2x32(pair_idx, pc.seed);
+        float u1 = uint_to_uniform(r.x | 1u);  // avoid log(0)
+        float u2 = uint_to_uniform(r.y);
+        float radius = sqrt(-2.0 * log(u1));
+        float theta = 6.283185307 * u2;
+
+        if ((i & 1u) == 0u)
+            out_data[i] = radius * cos(theta);
+        else
+            out_data[i] = radius * sin(theta);
+    }
+}
