@@ -134,6 +134,161 @@ static double bench_gpu_add_with_transfer(int N, int iters, VkPipe* pipe) {
 }
 
 /* ---------------------------------------------------------------- */
+/* Unary (exp) — persistent input/output buffers, persistent pipeline */
+/* ---------------------------------------------------------------- */
+
+static double bench_cpu_unary_exp(int N, int iters) {
+    std::vector<float> a(N, 0.5f), c(N);
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++) {
+        for (int i = 0; i < N; i++) c[i] = std::exp(a[i]);
+    }
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    volatile float sink = c[N/2]; (void)sink;
+    return ms / iters;
+}
+
+static double bench_gpu_unary_exp(int N, int iters, VkPipe* pipe) {
+    VkDeviceSize sz = N * sizeof(float);
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    VkBuf buf_in{}, buf_out{};
+    buf_alloc(&buf_in, sz, usage, mem);
+    buf_alloc(&buf_out, sz, usage, mem);
+    std::vector<float> a(N, 0.5f);
+    upload(&buf_in, a.data(), sz);
+
+    VkBuffer bufs[2] = {buf_in.buffer, buf_out.buffer};
+    uint32_t n = (uint32_t)N;
+    uint32_t groups = (N + 255) / 256;
+
+    int warmup_iters = N >= 1048576 ? 30 : (N >= 65536 ? 10 : 3);
+    for (int i = 0; i < warmup_iters; i++)
+        dispatch(pipe, bufs, 2, groups, sizeof(uint32_t), &n);
+
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++)
+        dispatch(pipe, bufs, 2, groups, sizeof(uint32_t), &n);
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    buf_free(&buf_in);
+    buf_free(&buf_out);
+    return ms / iters;
+}
+
+/* ---------------------------------------------------------------- */
+/* Matmul (naive M×K · K×N) — persistent buffers + pipeline. Needs   */
+/* a 2D dispatch which the existing 1D dispatch() helper doesn't do, */
+/* so the dispatch dance is inlined here (mirrors test_matmul.cpp).  */
+/* ---------------------------------------------------------------- */
+
+struct MatPush { uint32_t M; uint32_t N; uint32_t K; };
+
+static double bench_cpu_matmul(int M, int N, int K, int iters) {
+    std::vector<float> A(M*K, 1.0f), B(K*N, 1.0f), C(M*N);
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++) {
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++) {
+                float acc = 0;
+                for (int k = 0; k < K; k++)
+                    acc += A[m*K+k] * B[k*N+n];
+                C[m*N+n] = acc;
+            }
+    }
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    volatile float sink = C[M/2*N + N/2]; (void)sink;
+    return ms / iters;
+}
+
+static double bench_gpu_matmul(int M, int N, int K, int iters, VkPipe* pipe) {
+    VkDeviceSize sz_a = M * K * sizeof(float);
+    VkDeviceSize sz_b = K * N * sizeof(float);
+    VkDeviceSize sz_c = M * N * sizeof(float);
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    VkBuf buf_a{}, buf_b{}, buf_c{};
+    buf_alloc(&buf_a, sz_a, usage, mem);
+    buf_alloc(&buf_b, sz_b, usage, mem);
+    buf_alloc(&buf_c, sz_c, usage, mem);
+    std::vector<float> A(M*K, 1.0f), B(K*N, 1.0f);
+    upload(&buf_a, A.data(), sz_a);
+    upload(&buf_b, B.data(), sz_b);
+
+    VkBuffer bufs[3] = {buf_a.buffer, buf_b.buffer, buf_c.buffer};
+    MatPush pc = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
+    uint32_t gx = (N + 15) / 16;
+    uint32_t gy = (M + 15) / 16;
+
+    auto& ctx = g_vk_ctx;
+
+    auto run_one = [&]() {
+        VkDescriptorBufferInfo bi[3];
+        VkWriteDescriptorSet w[3];
+        for (int i = 0; i < 3; i++) {
+            bi[i] = {bufs[i], 0, VK_WHOLE_SIZE};
+            w[i] = {};
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = pipe->descriptor_set;
+            w[i].dstBinding = (uint32_t)i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[i].pBufferInfo = &bi[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+
+        VkCommandBufferAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = ctx.command_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer cmd;
+        vkAllocateCommandBuffers(ctx.device, &ai, &cmd);
+
+        VkCommandBufferBeginInfo bb{};
+        bb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bb);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pipe->pipeline_layout, 0, 1, &pipe->descriptor_set, 0, nullptr);
+        vkCmdPushConstants(cmd, pipe->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(MatPush), &pc);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        vkQueueSubmit(ctx.compute_queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(ctx.compute_queue);
+        vkFreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd);
+    };
+
+    for (int i = 0; i < 3; i++) run_one();   /* warmup */
+
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++) run_one();
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    buf_free(&buf_a);
+    buf_free(&buf_b);
+    buf_free(&buf_c);
+    return ms / iters;
+}
+
+/* ---------------------------------------------------------------- */
 /* Reductions (sum) — persistent input buffer; reduce() creates the  */
 /* per-call pipeline + partial buffers internally each invocation.   */
 /* That's the cost the current API surface charges; a persistent-    */
@@ -190,8 +345,9 @@ static double bench_gpu_sum(int N, int iters, const std::string& spv_path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <elementwise_binary.spv> [reduce.spv]\n", argv[0]);
-        fprintf(stderr, "  reduce.spv is optional; if present, runs the reduction bench.\n");
+        fprintf(stderr, "Usage: %s <binary.spv> [reduce.spv] [unary.spv] [matmul.spv]\n", argv[0]);
+        fprintf(stderr, "  Each optional shader path enables its bench section.\n");
+        fprintf(stderr, "  Order: argv[1]=binary, argv[2]=reduce, argv[3]=unary, argv[4]=matmul.\n");
         return 1;
     }
 
@@ -239,6 +395,80 @@ int main(int argc, char** argv) {
     printf("             optimization that matters for any real workload.\n");
 
     destroy_pipeline(&pipe);
+
+    /* ============================================================ */
+    /* Unary bench — only if elementwise_unary.spv was passed (3rd   */
+    /* arg). Spec constant 0 = exp; one representative op for perf.  */
+    /* ============================================================ */
+    if (argc >= 4) {
+        const char* unary_spv = argv[3];
+        FILE* f = fopen(unary_spv, "rb");
+        if (!f) {
+            fprintf(stderr, "warning: %s not found; skipping unary bench\n", unary_spv);
+        } else {
+            fclose(f);
+            VkShaderModule sh = load_shader(unary_spv);
+            VkPipe upipe{};
+            create_pipeline(&upipe, sh, 2, sizeof(uint32_t), 0 /* exp */);
+
+            printf("\n=== unary (exp) ===\n");
+            printf("%-10s  %10s  %12s  %10s\n",
+                   "N", "CPU (ms)", "persistent", "vs CPU");
+            printf("%-10s  %10s  %12s  %10s\n", "---", "---", "---", "---");
+
+            for (int s = 0; s < nsizes; s++) {
+                int N = sizes[s];
+                int iters = N < 65536 ? 1000 : (N < 1048576 ? 200 : 50);
+                double cpu_ms = bench_cpu_unary_exp(N, iters);
+                double gpu_ms = bench_gpu_unary_exp(N, iters, &upipe);
+                printf("%-10d  %10.4f  %12.4f  %9.2fx\n",
+                       N, cpu_ms, gpu_ms, cpu_ms / gpu_ms);
+            }
+
+            destroy_pipeline(&upipe);
+        }
+    }
+
+    /* ============================================================ */
+    /* Matmul bench — only if matmul.spv was passed (4th arg). Square */
+    /* matrices; CPU at 1024 is ~1s/iter so iter count drops sharply. */
+    /* ============================================================ */
+    if (argc >= 5) {
+        const char* matmul_spv = argv[4];
+        FILE* f = fopen(matmul_spv, "rb");
+        if (!f) {
+            fprintf(stderr, "warning: %s not found; skipping matmul bench\n", matmul_spv);
+        } else {
+            fclose(f);
+            VkShaderModule sh = load_shader(matmul_spv);
+            VkPipe mpipe{};
+            create_pipeline(&mpipe, sh, 3, sizeof(MatPush), 0);
+
+            printf("\n=== matmul (naive, square) ===\n");
+            printf("%-12s  %10s  %12s  %10s  %10s\n",
+                   "M=N=K", "CPU (ms)", "persistent", "vs CPU", "GFLOPS");
+            printf("%-12s  %10s  %12s  %10s  %10s\n", "---", "---", "---", "---", "---");
+
+            int dims[] = {64, 128, 256, 512, 1024};
+            int ndims = sizeof(dims) / sizeof(dims[0]);
+
+            for (int s = 0; s < ndims; s++) {
+                int D = dims[s];
+                /* CPU is O(D^3); cap iter count to keep wall time bounded */
+                int cpu_iters = D <= 128 ? 50 : (D <= 256 ? 10 : (D <= 512 ? 3 : 1));
+                int gpu_iters = D <= 128 ? 200 : (D <= 256 ? 100 : (D <= 512 ? 50 : 20));
+
+                double cpu_ms = bench_cpu_matmul(D, D, D, cpu_iters);
+                double gpu_ms = bench_gpu_matmul(D, D, D, gpu_iters, &mpipe);
+                double flops = 2.0 * D * D * D;            /* 2*D^3 ops per matmul */
+                double gflops = flops / (gpu_ms / 1000.0) / 1e9;
+                printf("%-12d  %10.4f  %12.4f  %9.2fx  %10.2f\n",
+                       D, cpu_ms, gpu_ms, cpu_ms / gpu_ms, gflops);
+            }
+
+            destroy_pipeline(&mpipe);
+        }
+    }
 
     /* ============================================================ */
     /* Reduction bench — only if reduce.spv was passed.             */
