@@ -48,6 +48,59 @@ proves the Vulkan backend scales on real hardware.
 
 ---
 
+## Unary (exp) — SHADERS_PLAN.md iter 2
+
+13 unary ops via specialization constant; bench measures `exp` as
+representative. Persistent input/output buffers, persistent
+pipeline. Same N range as elementwise binary.
+
+```
+N           CPU (ms)    persistent     vs CPU
+1024          0.0039      0.1642        0.02x
+4096          0.0382      0.1230        0.31x
+16384         0.1177      0.0517        2.28x
+65536         0.4407      0.0559        7.89x
+262144        1.6017      0.0460       34.79x
+1048576       5.5057      0.1303       42.25x
+4194304      16.6453      0.3041       54.73x   ← best vs-CPU on any kernel
+```
+
+`exp()` is more expensive per element on CPU than add (transcendental
+vs trivial), so the GPU's parallelism wins harder. The 54.73× at
+4M is the largest single-kernel speedup we've measured. The same
+shape extends to log / sqrt / sigmoid / tanh / relu and the eight
+others — the spec-constant fast path means one pipeline, many ops.
+
+---
+
+## Matmul (naive, square) — SHADERS_PLAN.md iter 3
+
+`shaders/matmul.comp` — naive M×K · K×N. Each thread computes one
+output element via a K-deep inner loop. 16×16 workgroup, 2D
+dispatch grid.
+
+```
+M=N=K       CPU (ms)   persistent    vs CPU      GFLOPS
+64            0.1711     0.0706       2.42x        7.42
+128           1.7121     0.1639      10.44x       25.59
+256          25.7671     0.2028     127.09x      165.50
+512         308.1414     1.5451     199.43x      173.73
+1024       2505.9195     9.6811     258.85x      221.82
+```
+
+258× speedup at 1024² and 222 GFLOPS — solid for the naive
+algorithm. The RTX 3060 Ti's f32 peak is ~16 TFLOPS, so we're at
+**1.4% of peak**. The tiled matmul (SHADERS_PLAN.md iter 4) lifts
+this to ~50–70% of peak by exploiting shared-memory tile reuse;
+that's a 10–20× per-element speedup on top of what's here.
+
+For now: the naive kernel is correct, fast enough to start the
+Nx.Vulkan wrapper, and a useful baseline. Tiled lands when there's
+a reason to optimize (i.e., when the BEAM-side workload's matmul
+is the hot loop).
+
+---
+
 ## Reductions (SHADERS_PLAN.md iter 1)
 
 `reduce()` API: `scalar reduce(VkBuf* input, int N, ReduceOp op,
