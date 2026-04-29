@@ -59,8 +59,14 @@ static double bench_gpu_add(int N, int iters, VkPipe* pipe) {
     uint32_t n = (uint32_t)N;
     uint32_t groups = (N + 255) / 256;
 
-    /* Warmup */
-    for (int i = 0; i < 3; i++)
+    /* Warmup: enough dispatches at this size to ensure the GPU has
+     * ramped through its power states before we start timing. The
+     * default 3-iter warmup was too short for large N — 4M dispatches
+     * are quick once the GPU is at P0 but the ramp from P8 takes
+     * tens of milliseconds. Scale warmup with N so smaller sizes
+     * don't pay the full warmup time. */
+    int warmup_iters = N >= 1048576 ? 30 : (N >= 65536 ? 10 : 3);
+    for (int i = 0; i < warmup_iters; i++)
         dispatch(pipe, bufs, 3, groups, sizeof(uint32_t), &n);
 
     /* Benchmark */
