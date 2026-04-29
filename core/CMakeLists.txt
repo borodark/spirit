@@ -423,7 +423,7 @@ endif()
 
 ### Extra Vulkan things
 if( SPIRIT_USE_VULKAN )
-    target_link_libraries( ${META_PROJECT_NAME} INTERFACE Vulkan::Vulkan )
+    target_link_libraries( ${META_PROJECT_NAME} PUBLIC Vulkan::Vulkan )
     set( SPIRIT_COMPILE_DEFINITIONS ${SPIRIT_COMPILE_DEFINITIONS} -DSPIRIT_USE_VULKAN )
     ### Add Vulkan backend source
     target_sources( ${META_PROJECT_NAME} PRIVATE

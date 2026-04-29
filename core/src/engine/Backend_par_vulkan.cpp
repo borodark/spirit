@@ -160,8 +160,8 @@ void vk_destroy()
 {
     auto& ctx = g_vk_ctx;
 
-    for (auto& [path, mod] : ctx.shader_cache)
-        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    for (auto& kv : ctx.shader_cache)
+        vkDestroyShaderModule(ctx.device, kv.second, nullptr);
     ctx.shader_cache.clear();
 
     if (ctx.sync_fence) vkDestroyFence(ctx.device, ctx.sync_fence, nullptr);
