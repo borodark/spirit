@@ -1,6 +1,6 @@
 # Vulkan compute backend — RTX 3060 Ti results (Linux, 192.168.0.249)
 
-**Date:** 2026-04-28
+**Date:** 2026-04-29 (iter 1 of PERSISTENT_BUFFERS_PLAN.md)
 **Branch:** feature/vulkan-backend
 **GPU:** NVIDIA GeForce RTX 3060 Ti, 8 GB, Ampere (4864 CUDA cores)
 **Driver:** 580.126.20, Vulkan 1.3.275
@@ -13,27 +13,37 @@ arch, similar perf.)
 
 ## TL;DR
 
-All 3 tests pass. Best-observed dispatch numbers:
+All 3 tests pass. **Persistent device buffers** (alloc once, reuse
+across operations) deliver up to **841× speedup over the naïve
+alloc-each-iteration pattern**, plus 15× over CPU at 4M elements.
 
 ```
-N               CPU (ms)    GPU (ms)    speedup
-1024              0.0007      0.04        ~0.02x   (dispatch-bound)
-65536             0.0573      0.04         ~1.4x   (crossover)
-262144            0.20        0.05         3.7x
-1048576           0.62        0.07         8.8x   (sweet spot)
-4194304           2.97        0.22        13.3x
+N           CPU (ms)   persistent     vs CPU   naive (xfer)   vs naive
+---              ---          ---        ---            ---        ---
+1024          0.0005       0.0416      0.01x         3.7473      90.0x
+4096          0.0022       0.0514      0.04x         3.6891      71.8x
+16384         0.0135       0.0520      0.26x         4.5010      86.6x
+65536         0.0554       0.0409      1.35x         6.9135     169.2x
+262144        0.2072       0.0559      3.71x        16.7346     299.6x
+1048576       0.6539       0.0766      8.53x        54.1298     706.2x
+4194304       3.7637       0.2432     15.48x       204.6382     841.6x
 ```
+
+The "vs naive" column is the story this iteration captures: any
+caller running ops in a hot loop must reuse buffers across
+iterations or lose two to three orders of magnitude of throughput
+to alloc + transfer overhead.
 
 Compared to the FreeBSD GT 750M (Kepler, 384 cores) baseline:
 
 | N | GT 750M GPU | RTX 3060 Ti GPU | speedup ratio |
 |---|---|---|---|
-| 1M | 0.30 ms | 0.07 ms | 4.3× faster |
-| 4M | 1.41 ms | 0.22 ms | 6.4× faster |
+| 1M | 0.30 ms | 0.077 ms | 3.9× faster |
+| 4M | 1.41 ms | 0.243 ms | 5.8× faster |
 
 **The same code, the same shader, the same backend** — the FreeBSD
 GT 750M proves the cross-platform path works; the Linux 3060 Ti
-proves the Vulkan backend scales linearly on real hardware.
+proves the Vulkan backend scales on real hardware.
 
 ---
 
