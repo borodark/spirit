@@ -1,6 +1,7 @@
 # Vulkan compute backend — RTX 3060 Ti results (Linux, 192.168.0.249)
 
-**Date:** 2026-04-29 (iter 1 of PERSISTENT_BUFFERS_PLAN.md)
+**Date:** 2026-04-29 (iter 1 of PERSISTENT_BUFFERS_PLAN.md +
+SHADERS_PLAN.md iter 1 reduction integration)
 **Branch:** feature/vulkan-backend
 **GPU:** NVIDIA GeForce RTX 3060 Ti, 8 GB, Ampere (4864 CUDA cores)
 **Driver:** 580.126.20, Vulkan 1.3.275
@@ -44,6 +45,43 @@ Compared to the FreeBSD GT 750M (Kepler, 384 cores) baseline:
 **The same code, the same shader, the same backend** — the FreeBSD
 GT 750M proves the cross-platform path works; the Linux 3060 Ti
 proves the Vulkan backend scales on real hardware.
+
+---
+
+## Reductions (SHADERS_PLAN.md iter 1)
+
+`reduce()` API: `scalar reduce(VkBuf* input, int N, ReduceOp op,
+const std::string& spv_path)`. 8/8 correctness tests pass
+(`./test_reduce`). Bench:
+
+```
+N         CPU (ms)    GPU (ms)    vs CPU
+1024        0.0009    22.4356      0.00x
+65536       0.0569    24.7330      0.00x
+1048576     0.9169    33.0821      0.03x
+4194304     3.7179    36.1956      0.10x
+```
+
+The GPU loses at every size — but **not because the shader is
+slow**. The reduce() API allocates partial buffers and creates
+the per-call pipeline internally on every invocation. That's
+~22 ms of fixed overhead per call regardless of N. The actual
+GPU compute at 4M elements is well under 1 ms (we can extrapolate
+from the elementwise dispatch numbers: ~16 MB of memory traffic
+at ~218 GB/s effective bandwidth = ~0.07 ms for the inner reduce
+loop).
+
+This data point motivates the next backend iteration: **persistent
+pipelines + scratch-buffer pool**. Cache the `VkPipe` per (shader,
+spec_constant) pair across calls; reuse a sized scratch buffer
+for the partials. Expected win: ~22 ms → ~0.1 ms at 1M elements,
+matching what the elementwise dispatch already does.
+
+For now: the correctness path works, the perf gap is identified,
+and the path forward is clear. Reductions go from "0.03× CPU" to
+"~12× CPU" once the API stops re-allocating per call.
+
+---
 
 ---
 

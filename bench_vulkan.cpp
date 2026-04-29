@@ -133,9 +133,65 @@ static double bench_gpu_add_with_transfer(int N, int iters, VkPipe* pipe) {
     return ms / iters;
 }
 
+/* ---------------------------------------------------------------- */
+/* Reductions (sum) — persistent input buffer; reduce() creates the  */
+/* per-call pipeline + partial buffers internally each invocation.   */
+/* That's the cost the current API surface charges; a persistent-    */
+/* pipeline variant would be faster but requires a richer API. Bench */
+/* what's actually shipping.                                          */
+/* ---------------------------------------------------------------- */
+
+static double bench_cpu_sum(int N, int iters) {
+    std::vector<float> a(N, 1.0f);
+    auto t0 = Clock::now();
+    double total = 0;
+    for (int it = 0; it < iters; it++) {
+        double s = 0;
+        for (int i = 0; i < N; i++) s += a[i];
+        total += s;
+    }
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    volatile double sink = total;
+    (void)sink;
+    return ms / iters;
+}
+
+static double bench_gpu_sum(int N, int iters, const std::string& spv_path) {
+    VkDeviceSize sz = N * sizeof(float);
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    VkBuf in_buf{};
+    buf_alloc(&in_buf, sz, usage, mem);
+    std::vector<float> a(N, 1.0f);
+    upload(&in_buf, a.data(), sz);
+
+    /* Warmup: one full reduction at this N to ramp the GPU + warm
+     * the shader cache before the timed loop. */
+    int warmup_iters = N >= 1048576 ? 5 : 3;
+    for (int i = 0; i < warmup_iters; i++)
+        (void)reduce(&in_buf, N, REDUCE_SUM, spv_path);
+
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++) {
+        (void)reduce(&in_buf, N, REDUCE_SUM, spv_path);
+    }
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    buf_free(&in_buf);
+    return ms / iters;
+}
+
+/* ---------------------------------------------------------------- */
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <elementwise_binary.spv>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <elementwise_binary.spv> [reduce.spv]\n", argv[0]);
+        fprintf(stderr, "  reduce.spv is optional; if present, runs the reduction bench.\n");
         return 1;
     }
 
@@ -183,6 +239,45 @@ int main(int argc, char** argv) {
     printf("             optimization that matters for any real workload.\n");
 
     destroy_pipeline(&pipe);
+
+    /* ============================================================ */
+    /* Reduction bench — only if reduce.spv was passed.             */
+    /* ============================================================ */
+    if (argc >= 3) {
+        const char* reduce_spv = argv[2];
+        FILE* f = fopen(reduce_spv, "rb");
+        if (!f) {
+            fprintf(stderr, "warning: %s not found; skipping reduction bench\n", reduce_spv);
+        } else {
+            fclose(f);
+            printf("\n=== reductions (sum) ===\n");
+            printf("%-10s  %10s  %10s  %10s\n",
+                   "N", "CPU (ms)", "GPU (ms)", "vs CPU");
+            printf("%-10s  %10s  %10s  %10s\n", "---", "---", "---", "---");
+
+            for (int s = 0; s < nsizes; s++) {
+                int N = sizes[s];
+                /* Reductions are cheaper than elementwise per element
+                 * but pay pipeline-create overhead per call. Use fewer
+                 * iters at large N to cap wall time. */
+                int iters = N < 65536 ? 200 : (N < 1048576 ? 50 : 20);
+
+                double cpu_ms = bench_cpu_sum(N, iters);
+                double gpu_ms = bench_gpu_sum(N, iters, reduce_spv);
+
+                printf("%-10d  %10.4f  %10.4f  %9.2fx\n",
+                       N, cpu_ms, gpu_ms, cpu_ms / gpu_ms);
+            }
+
+            printf("\n");
+            printf("CPU:    single-core sum loop (no SIMD, no OpenMP)\n");
+            printf("GPU:    reduce() — persistent input buffer, but per-call\n");
+            printf("        pipeline create + partial-buffer alloc. The current\n");
+            printf("        API charges this overhead every reduction. A\n");
+            printf("        persistent-pipeline variant would be faster.\n");
+        }
+    }
+
     vk_destroy();
     return 0;
 }
