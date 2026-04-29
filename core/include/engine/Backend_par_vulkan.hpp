@@ -142,9 +142,14 @@ int dispatch(VkPipe* p, VkBuffer* buffers, uint32_t n_buffers,
  * The shader reads/writes through storage buffer bindings. */
 void apply(int N, VkPipe* pipe, VkBuffer* buffers, uint32_t n_buffers);
 
-/* Reduction: sum all elements of a device buffer into a host scalar.
- * Uses a two-pass subgroup reduction shader. */
-scalar reduce_sum(VkBuf* input, int N);
+/* Reduction ops — matches specialization constants in reduce.comp */
+enum ReduceOp { REDUCE_SUM = 0, REDUCE_MIN = 1, REDUCE_MAX = 2 };
+
+/* GPU reduction via two-pass tree reduce shader.
+ * Returns the scalar result on the host.
+ * reduce_spv_path: path to compiled reduce.spv shader. */
+scalar reduce(VkBuf* input, int N, ReduceOp op, const std::string& reduce_spv_path);
+scalar reduce_sum(VkBuf* input, int N, const std::string& reduce_spv_path);
 
 /* Scale all elements: buf[i] *= alpha */
 void scale(VkBuf* buf, int N, scalar alpha);

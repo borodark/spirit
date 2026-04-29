@@ -501,15 +501,63 @@ void apply(int N, VkPipe* pipe, VkBuffer* buffers, uint32_t n_buffers)
     dispatch(pipe, buffers, n_buffers, groups, sizeof(uint32_t), &push);
 }
 
-scalar reduce_sum(VkBuf* input, int N)
+scalar reduce(VkBuf* input, int N, ReduceOp op, const std::string& reduce_spv_path)
 {
-    /* TODO: implement GPU reduction shader.
-     * For now, download and sum on CPU. */
-    std::vector<scalar> data(N);
-    download(input, data.data(), N * sizeof(scalar));
-    scalar sum = 0;
-    for (int i = 0; i < N; i++) sum += data[i];
-    return sum;
+    if (N <= 0) return 0;
+
+    VkShaderModule shader = load_shader(reduce_spv_path);
+    if (!shader) return 0;
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    /* Pass 1: N elements → num_groups partial results */
+    uint32_t num_groups = (N + 255) / 256;
+
+    VkBuf partial{};
+    buf_alloc(&partial, num_groups * sizeof(scalar), usage, mem);
+
+    VkPipe pipe1{};
+    create_pipeline(&pipe1, shader, 2, sizeof(uint32_t), (int32_t)op);
+
+    VkBuffer bufs1[2] = { input->buffer, partial.buffer };
+    uint32_t n1 = (uint32_t)N;
+    dispatch(&pipe1, bufs1, 2, num_groups, sizeof(uint32_t), &n1);
+    destroy_pipeline(&pipe1);
+
+    /* Iterate until we have a single value */
+    while (num_groups > 1) {
+        uint32_t next_groups = (num_groups + 255) / 256;
+
+        VkBuf partial2{};
+        buf_alloc(&partial2, next_groups * sizeof(scalar), usage, mem);
+
+        VkPipe pipe_n{};
+        create_pipeline(&pipe_n, shader, 2, sizeof(uint32_t), (int32_t)op);
+
+        VkBuffer bufs_n[2] = { partial.buffer, partial2.buffer };
+        uint32_t n_n = num_groups;
+        dispatch(&pipe_n, bufs_n, 2, next_groups, sizeof(uint32_t), &n_n);
+        destroy_pipeline(&pipe_n);
+
+        buf_free(&partial);
+        partial = partial2;
+        num_groups = next_groups;
+    }
+
+    /* Read back single scalar */
+    scalar result = 0;
+    download(&partial, &result, sizeof(scalar));
+    buf_free(&partial);
+
+    return result;
+}
+
+scalar reduce_sum(VkBuf* input, int N, const std::string& reduce_spv_path)
+{
+    return reduce(input, N, REDUCE_SUM, reduce_spv_path);
 }
 
 void scale(VkBuf* buf, int N, scalar alpha)

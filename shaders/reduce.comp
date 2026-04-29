@@ -1,0 +1,67 @@
+#version 450
+
+layout (local_size_x = 256) in;
+
+// Specialization constant selects reduction op
+layout (constant_id = 0) const int OP = 0;  // 0=sum, 1=min, 2=max
+
+// Push constants
+layout (push_constant) uniform Push {
+    uint n;       // number of input elements
+} pc;
+
+layout (std430, binding = 0) readonly buffer Input { float in_data[]; };
+layout (std430, binding = 1) writeonly buffer Output { float out_data[]; };
+
+shared float sdata[256];
+
+float identity() {
+    switch (OP) {
+        case 0:  return 0.0;            // sum
+        case 1:  return 3.402823466e+38; // min (FLT_MAX)
+        case 2:  return -3.402823466e+38; // max (-FLT_MAX)
+        default: return 0.0;
+    }
+}
+
+float combine(float a, float b) {
+    switch (OP) {
+        case 0:  return a + b;
+        case 1:  return min(a, b);
+        case 2:  return max(a, b);
+        default: return a + b;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Load from global memory or use identity for out-of-bounds
+    float val = (gid < pc.n) ? in_data[gid] : identity();
+
+    // Grid-stride accumulation: if N > total threads, each thread
+    // accumulates multiple elements before the shared-memory phase.
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint idx = gid + stride;
+    while (idx < pc.n) {
+        val = combine(val, in_data[idx]);
+        idx += stride;
+    }
+
+    sdata[tid] = val;
+    barrier();
+
+    // Tree reduction in shared memory
+    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sdata[tid] = combine(sdata[tid], sdata[tid + s]);
+        }
+        barrier();
+    }
+
+    // Workgroup result → output buffer
+    if (tid == 0u) {
+        out_data[gl_WorkGroupID.x] = sdata[0];
+    }
+}
