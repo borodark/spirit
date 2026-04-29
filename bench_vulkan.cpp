@@ -17,6 +17,7 @@
 #include <cmath>
 #include <chrono>
 #include <vector>
+#include <random>
 
 using namespace Engine::Backend::vulkan;
 using Clock = std::chrono::high_resolution_clock;
@@ -289,6 +290,55 @@ static double bench_gpu_matmul(int M, int N, int K, int iters, VkPipe* pipe) {
 }
 
 /* ---------------------------------------------------------------- */
+/* Random (uniform) — persistent output buffer + persistent pipeline. */
+/* No input; the GPU generates N values from (seed, thread_id).      */
+/* CPU baseline: std::mt19937 seeded once, generate N floats.         */
+/* ---------------------------------------------------------------- */
+
+static double bench_cpu_uniform(int N, int iters) {
+    std::vector<float> a(N);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++) {
+        rng.seed(42);
+        for (int i = 0; i < N; i++) a[i] = dist(rng);
+    }
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    volatile float sink = a[N/2]; (void)sink;
+    return ms / iters;
+}
+
+static double bench_gpu_uniform(int N, int iters, VkPipe* pipe) {
+    VkDeviceSize sz = N * sizeof(float);
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkMemoryPropertyFlags mem = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    VkBuf buf{};
+    buf_alloc(&buf, sz, usage, mem);
+
+    VkBuffer bufs[1] = {buf.buffer};
+    struct { uint32_t n; uint32_t seed; } push = {(uint32_t)N, 42};
+    uint32_t groups = (N + 255) / 256;
+
+    int warmup_iters = N >= 1048576 ? 30 : (N >= 65536 ? 10 : 3);
+    for (int i = 0; i < warmup_iters; i++)
+        dispatch(pipe, bufs, 1, groups, sizeof(push), &push);
+
+    auto t0 = Clock::now();
+    for (int it = 0; it < iters; it++)
+        dispatch(pipe, bufs, 1, groups, sizeof(push), &push);
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    buf_free(&buf);
+    return ms / iters;
+}
+
+/* ---------------------------------------------------------------- */
 /* Reductions (sum) — persistent input buffer; reduce() creates the  */
 /* per-call pipeline + partial buffers internally each invocation.   */
 /* That's the cost the current API surface charges; a persistent-    */
@@ -345,9 +395,9 @@ static double bench_gpu_sum(int N, int iters, const std::string& spv_path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <binary.spv> [reduce.spv] [unary.spv] [matmul.spv]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <binary.spv> [reduce.spv] [unary.spv] [matmul.spv] [random.spv]\n", argv[0]);
         fprintf(stderr, "  Each optional shader path enables its bench section.\n");
-        fprintf(stderr, "  Order: argv[1]=binary, argv[2]=reduce, argv[3]=unary, argv[4]=matmul.\n");
+        fprintf(stderr, "  Order: argv[1]=binary, argv[2]=reduce, argv[3]=unary, argv[4]=matmul, argv[5]=random.\n");
         return 1;
     }
 
@@ -467,6 +517,39 @@ int main(int argc, char** argv) {
             }
 
             destroy_pipeline(&mpipe);
+        }
+    }
+
+    /* ============================================================ */
+    /* Random (uniform) bench — only if random.spv was passed (5th). */
+    /* Spec constant 0 = uniform; spec constant 1 = normal (skipped). */
+    /* ============================================================ */
+    if (argc >= 6) {
+        const char* random_spv = argv[5];
+        FILE* f = fopen(random_spv, "rb");
+        if (!f) {
+            fprintf(stderr, "warning: %s not found; skipping random bench\n", random_spv);
+        } else {
+            fclose(f);
+            VkShaderModule sh = load_shader(random_spv);
+            VkPipe rpipe{};
+            create_pipeline(&rpipe, sh, 1, 2 * sizeof(uint32_t), 0 /* uniform */);
+
+            printf("\n=== random (uniform [0,1)) ===\n");
+            printf("%-10s  %10s  %12s  %10s\n",
+                   "N", "CPU (ms)", "persistent", "vs CPU");
+            printf("%-10s  %10s  %12s  %10s\n", "---", "---", "---", "---");
+
+            for (int s = 0; s < nsizes; s++) {
+                int N = sizes[s];
+                int iters = N < 65536 ? 1000 : (N < 1048576 ? 200 : 50);
+                double cpu_ms = bench_cpu_uniform(N, iters);
+                double gpu_ms = bench_gpu_uniform(N, iters, &rpipe);
+                printf("%-10d  %10.4f  %12.4f  %9.2fx\n",
+                       N, cpu_ms, gpu_ms, cpu_ms / gpu_ms);
+            }
+
+            destroy_pipeline(&rpipe);
         }
     }
 

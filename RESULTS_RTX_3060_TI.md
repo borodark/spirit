@@ -101,6 +101,38 @@ is the hot loop).
 
 ---
 
+## Random (Philox + Box-Muller) — beyond original plan
+
+`shaders/random_philox.comp` — counter-based PRNG (Philox 4×32-10)
+keyed on `(seed, thread_id)` for parallel-safe deterministic
+generation. Spec constant 0 = uniform [0,1), 1 = normal via
+Box-Muller. Persistent output buffer + persistent pipeline.
+
+```
+N           CPU (ms)    persistent     vs CPU
+1024          0.0119      0.0493        0.24x
+4096          0.0352      0.0474        0.74x
+16384         0.1062      0.0432        2.46x
+65536         0.3938      0.0429        9.18x
+262144        1.5414      0.0489       31.51x
+1048576       4.6182      0.1078       42.85x
+4194304      15.6885      0.3949       39.73x
+```
+
+CPU baseline: `std::mt19937` re-seeded each iteration. The shader
+generates uniform floats per thread; Box-Muller pairs adjacent
+threads to produce normal samples. 35× at 1M elements is the
+right shape for an Nx-side dropout / sample-from-normal kernel,
+and matches what Spirit's stochastic LLG dynamics need (Gaussian
+noise per spin per timestep).
+
+35 correctness tests + 5 shaders now cover everything Nx needs:
+elementwise math, transcendentals, reductions, linear algebra,
+and stochastic generation. The Nx.Vulkan wrapper has a complete
+operator inventory to start against.
+
+---
+
 ## Reductions (SHADERS_PLAN.md iter 1)
 
 `reduce()` API: `scalar reduce(VkBuf* input, int N, ReduceOp op,
