@@ -17,8 +17,13 @@
  */
 
 #include <vulkan/vulkan.h>
-#include <engine/Vectormath_Defines.hpp>
 #include <cstdint>
+
+/* Use Spirit's scalar type if available, otherwise default to float. */
+#ifndef SPIRIT_SCALAR_TYPE
+#define SPIRIT_SCALAR_TYPE float
+#endif
+using scalar = SPIRIT_SCALAR_TYPE;
 #include <cstring>
 #include <string>
 #include <vector>
