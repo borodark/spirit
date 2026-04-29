@@ -68,6 +68,44 @@ extern VkContext g_vk_ctx;
 /* ----------------------------------------------------------------
  * GPU buffer — wraps VkBuffer + VkDeviceMemory.
  * Used as the backing store for field<T> on Vulkan.
+ *
+ * USAGE PATTERN: persistent device-resident buffers
+ * --------------------------------------------------
+ * Allocate once, dispatch many, download once. Per-op alloc + xfer
+ * is ~50 ms for a 1M-element f32 buffer on an RTX 3060 Ti; the
+ * dispatch itself is ~70 us. The 99.9% gap is the alloc + xfer
+ * overhead — eliminated by holding the VkBuf across operations.
+ *
+ * Anti-pattern (don't do this in a hot loop):
+ *
+ *     for (int i = 0; i < iters; i++) {
+ *         buf_alloc(&a); buf_alloc(&b); buf_alloc(&c);  // ~10 ms
+ *         upload(&a, ha, sz); upload(&b, hb, sz);        // ~20 ms
+ *         dispatch(...);                                 // ~0.07 ms
+ *         download(&c, hc, sz);                          // ~10 ms
+ *         buf_free(&a); buf_free(&b); buf_free(&c);     // ~10 ms
+ *     }
+ *
+ * Persistent pattern (the right shape):
+ *
+ *     // once: alloc + initial upload
+ *     VkBuf a, b, c;
+ *     buf_alloc(&a, sz, ...); buf_alloc(&b, sz, ...); buf_alloc(&c, sz, ...);
+ *     upload(&a, ha, sz);
+ *     upload(&b, hb, sz);
+ *
+ *     // many: dispatch only
+ *     for (int i = 0; i < iters; i++)
+ *         dispatch(pipe, bufs, 3, groups, sizeof(uint32_t), &n);
+ *
+ *     // once: download + free
+ *     download(&c, hc, sz);
+ *     buf_free(&a); buf_free(&b); buf_free(&c);
+ *
+ * For Spirit's simulation loop and Nx-style tensor lifecycles, the
+ * persistent pattern is the only viable shape; benchmarks show
+ * ~700x speedup over the anti-pattern at 1M elements.
+ * See PERSISTENT_BUFFERS_PLAN.md for the optimization roadmap.
  * ---------------------------------------------------------------- */
 
 struct VkBuf

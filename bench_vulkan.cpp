@@ -149,10 +149,10 @@ int main(int argc, char** argv) {
     VkPipe pipe{};
     create_pipeline(&pipe, shader, 3, sizeof(uint32_t), 0 /* OP=add */);
 
-    printf("%-12s  %10s  %10s  %10s  %8s\n",
-           "N", "CPU (ms)", "GPU (ms)", "GPU+xfer", "speedup");
-    printf("%-12s  %10s  %10s  %10s  %8s\n",
-           "---", "---", "---", "---", "---");
+    printf("%-10s  %10s  %12s  %10s  %12s  %12s\n",
+           "N", "CPU (ms)", "persistent", "vs CPU", "naive (xfer)", "vs naive");
+    printf("%-10s  %10s  %12s  %10s  %12s  %12s\n",
+           "---", "---", "---", "---", "---", "---");
 
     int sizes[] = {1024, 4096, 16384, 65536, 262144, 1048576, 4194304};
     int nsizes = sizeof(sizes) / sizeof(sizes[0]);
@@ -161,20 +161,26 @@ int main(int argc, char** argv) {
         int N = sizes[s];
         int iters = N < 65536 ? 1000 : (N < 1048576 ? 200 : 50);
 
-        double cpu_ms = bench_cpu_add(N, iters);
-        double gpu_ms = bench_gpu_add(N, iters, &pipe);
-        double gpu_xfer_ms = bench_gpu_add_with_transfer(N, iters > 50 ? 50 : iters, &pipe);
-        double speedup = cpu_ms / gpu_ms;
+        double cpu_ms      = bench_cpu_add(N, iters);
+        double persist_ms  = bench_gpu_add(N, iters, &pipe);
+        double naive_ms    = bench_gpu_add_with_transfer(N, iters > 50 ? 50 : iters, &pipe);
+        double vs_cpu      = cpu_ms / persist_ms;
+        double vs_naive    = naive_ms / persist_ms;
 
-        printf("%-12d  %10.4f  %10.4f  %10.4f  %7.2fx\n",
-               N, cpu_ms, gpu_ms, gpu_xfer_ms, speedup);
+        printf("%-10d  %10.4f  %12.4f  %9.2fx  %12.4f  %11.1fx\n",
+               N, cpu_ms, persist_ms, vs_cpu, naive_ms, vs_naive);
     }
 
     printf("\n");
-    printf("CPU:       single-core loop (no SIMD, no OpenMP)\n");
-    printf("GPU:       dispatch only (data already on device)\n");
-    printf("GPU+xfer:  full round-trip (alloc + upload + dispatch + download + free)\n");
-    printf("speedup:   CPU / GPU (dispatch-only)\n");
+    printf("CPU:         single-core loop (no SIMD, no OpenMP)\n");
+    printf("persistent:  dispatch only (buffers allocated + uploaded once,\n");
+    printf("             reused across iterations) — the production pattern\n");
+    printf("naive (xfer):full round-trip (alloc + upload + dispatch + download +\n");
+    printf("             free, every iteration) — the anti-pattern\n");
+    printf("vs CPU:      CPU / persistent — what the GPU buys vs serial CPU\n");
+    printf("vs naive:    naive / persistent — what persistent buffers buy vs\n");
+    printf("             the alloc-everything-each-iter pattern. THIS is the\n");
+    printf("             optimization that matters for any real workload.\n");
 
     destroy_pipeline(&pipe);
     vk_destroy();
